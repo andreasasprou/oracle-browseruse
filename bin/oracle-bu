@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# oracle-bu — run Oracle's browser engine against a Browser Use cloud browser.
+#
+# Why: ChatGPT can challenge datacenter IPs. A Browser Use cloud browser gives
+# Oracle a residential
+# exit IP plus a persistent, already-signed-in ChatGPT profile.
+#
+# Requires:
+#   BROWSER_USE_API_KEY      injected securely through Polaris Variables
+#   BROWSER_USE_PROFILE_ID   or ~/.oracle/browser-use-profile-id
+#
+# The ORACLE_REMOTE_CHROME_WS support this depends on is a local patch to
+# Oracle's packaged dist. The oracle wrapper at
+# ~/.local/bin/oracle reapplies it automatically after a reinstall.
+#
+# Subcommands:
+#   oracle-bu login          start a browser on the profile and hold it open so
+#                            you can sign into ChatGPT in the dashboard Live View
+#   oracle-bu check          start and immediately stop a browser; prints whether
+#                            chatgpt.com is already authenticated on the profile
+#   oracle-bu <oracle args>  create a browser, run Oracle against it, stop it
+#
+# Browser Use does NOT stop a cloud browser when the CDP socket closes, so this
+# script always stops the browser it created, on every exit path.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+API="https://api.browser-use.com/api/v4/browsers"
+PROFILE_FILE="$HOME/.oracle/browser-use-profile-id"
+# 'cy' is rejected on the free plan ("Proxy country 'CY' is not available on the
+# free plan"). US residential is the only free option that still beats the
+# Cloudflare bot challenge; disabling the proxy returns to a datacenter IP.
+PROXY_COUNTRY="${BROWSER_USE_PROXY_COUNTRY:-us}"
+# Minutes. Kept short deliberately: this is the only backstop if the stop call
+# is ever missed. Max accepted by Browser Use is 240.
+TIMEOUT_MIN="${BROWSER_USE_TIMEOUT_MIN:-60}"
+
+err() {
+  local message="$*"
+  if [[ -n "${BROWSER_USE_API_KEY:-}" ]]; then
+    message="${message//"$BROWSER_USE_API_KEY"/<redacted-key>}"
+  fi
+  printf '%s\n' "oracle-bu: $message" >&2
+}
+
+[[ -n "${BROWSER_USE_API_KEY:-}" ]] || {
+  err "BROWSER_USE_API_KEY is not set. Inject BROWSER_USE_API_KEY from Polaris Variables before running oracle-bu."
+  exit 2
+}
+
+PROFILE_ID="${BROWSER_USE_PROFILE_ID:-}"
+if [[ -z "$PROFILE_ID" && -f "$PROFILE_FILE" ]]; then
+  PROFILE_ID="$(tr -d '[:space:]' < "$PROFILE_FILE")"
+fi
+[[ -n "$PROFILE_ID" ]] || {
+  err "no profile id. Create one at https://cloud.browser-use.com/settings?tab=profiles"
+  err "then: echo <profile-id> > $PROFILE_FILE"
+  exit 2
+}
+
+BROWSER_ID=""
+
+stop_browser() {
+  [[ -n "$BROWSER_ID" ]] || return 0
+  local id="$BROWSER_ID"
+  BROWSER_ID=""
+  if curl -fsS -X PATCH "$API/$id" \
+    -H "X-Browser-Use-API-Key: $BROWSER_USE_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"action":"stop"}' >/dev/null 2>&1; then
+    err "stopped cloud browser $id"
+  else
+    err "WARNING: failed to stop cloud browser $id — stop it in the dashboard"
+  fi
+}
+trap stop_browser EXIT INT TERM
+
+create_browser() {
+  local body response
+  body="$(jq -n \
+    --arg profileId "$PROFILE_ID" \
+    --arg country "$PROXY_COUNTRY" \
+    --argjson timeout "$TIMEOUT_MIN" \
+    '{profileId: $profileId, proxyCountryCode: $country, timeout: $timeout}')"
+
+  response="$(curl -sS -X POST "$API" \
+    -H "X-Browser-Use-API-Key: $BROWSER_USE_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body")" || { err "browser create request failed"; exit 1; }
+
+  BROWSER_ID="$(printf '%s' "$response" | jq -r '.id // empty')"
+  CDP_URL="$(printf '%s' "$response" | jq -r '.cdpUrl // empty')"
+  LIVE_URL="$(printf '%s' "$response" | jq -r '.liveUrl // empty')"
+
+  if [[ -z "$BROWSER_ID" || -z "$CDP_URL" ]]; then
+    # Never echo the raw response: it can carry the api key inside cdpUrl.
+    err "create returned no id/cdpUrl. Error was: $(printf '%s' "$response" | jq -rc '{detail, error, message} | del(..|nulls)' 2>/dev/null || echo '<unparseable>')"
+    exit 1
+  fi
+  # cdpUrl is an HTTPS endpoint, not a socket. Oracle needs the browser-level
+  # WebSocket, which Chrome publishes at <cdpUrl>/json/version.
+  WS_URL="$(curl -sS "${CDP_URL%/}/json/version" | jq -r '.webSocketDebuggerUrl // empty')"
+  [[ -n "$WS_URL" ]] || { err "cloud browser returned no webSocketDebuggerUrl"; exit 1; }
+
+  err "cloud browser $BROWSER_ID up (profile ${PROFILE_ID:0:8}…, proxy $PROXY_COUNTRY, timeout ${TIMEOUT_MIN}m)"
+  [[ -n "$LIVE_URL" ]] && err "Live View (watch the run): $LIVE_URL"
+}
+
+PREFLIGHT="$SCRIPT_DIR/../share/oracle-browseruse/preflight-chatgpt.mjs"
+PREFLIGHT_ATTEMPTS="${ORACLE_PREFLIGHT_ATTEMPTS:-3}"
+
+# Prove the new browser can actually reach ChatGPT's backend before Oracle types
+# a prompt into it. Without this, a browser whose proxy path is broken still
+# renders a cached, logged-in-looking shell; Oracle's login probe accepts it
+# (navigation.js:classifyAuth treats "backend unreachable + app shell present"
+# as authenticated), types the whole prompt, clicks send, and the run dies 60s
+# later with prompt-commit-timeout and no answer. Observed twice on
+# 2026-08-22 (sessions polaris-runtime-resource-boundary,
+# polaris-resource-boundary-review).
+create_verified_browser() {
+  [[ -f "$PREFLIGHT" ]] || { err "preflight script missing: $PREFLIGHT"; exit 1; }
+  local attempt result status
+  for ((attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt++)); do
+    create_browser
+    set +e
+    result="$(node "$PREFLIGHT" "$WS_URL")"
+    status=$?
+    set -e
+    case "$status" in
+      0)
+        err "preflight ok: $(printf '%s' "$result" | jq -rc '{reason, account}' 2>/dev/null || printf '%s' "$result")"
+        return 0
+        ;;
+      4)
+        err "preflight: this cloud profile is signed out of ChatGPT — $result"
+        err "Only a human can fix this: oracle-bu login"
+        stop_browser
+        exit 4
+        ;;
+      *)
+        err "preflight attempt $attempt/$PREFLIGHT_ATTEMPTS failed: $result"
+        stop_browser
+        ;;
+    esac
+  done
+  err "no cloud browser reached ChatGPT's backend after $PREFLIGHT_ATTEMPTS attempts; try again shortly"
+  exit 3
+}
+
+case "${1:-}" in
+  login)
+    create_browser
+    trap - EXIT INT TERM   # keep it alive after this shell exits
+    cat >&2 <<EOF
+
+Live View: $LIVE_URL
+
+In that remote browser:
+  1. go to chatgpt.com
+  2. sign in, completing 2FA if asked
+  3. confirm your chat history loads
+
+When done, stop it so the profile is saved:
+  oracle-bu stop $BROWSER_ID
+
+EOF
+    ;;
+
+  stop)
+    [[ -n "${2:-}" ]] || { err "usage: oracle-bu stop <browser-id>"; exit 2; }
+    BROWSER_ID="$2"
+    stop_browser
+    trap - EXIT INT TERM
+    ;;
+
+  check)
+    create_browser
+    err "created OK. Open Live View for $BROWSER_ID and confirm chatgpt.com is signed in, then press Enter to stop."
+    read -r _ < /dev/tty || true
+    ;;
+
+  "")
+    err "usage: oracle-bu <login|check|stop <id>|oracle args...>"
+    exit 2
+    ;;
+
+  *)
+    for arg in "$@"; do
+      case "$arg" in
+        --browser-tab|--browser-tab=*|--browser-manual-login|--browser-manual-login=*)
+          err "$arg is incompatible with Browser Use cloud browsers"
+          exit 2 ;;
+      esac
+    done
+    create_verified_browser
+    # Use the owner-selected Astra model unless the caller chose one explicitly.
+    # If the ChatGPT picker lacks this model the run fails fast and visibly;
+    # override with ORACLE_DEFAULT_MODEL or an explicit -m.
+    args=("$@")
+    if [[ " $* " != *" -m "* && " $* " != *" --model "* ]]; then
+      args=(-m "${ORACLE_DEFAULT_MODEL:-gpt-6-astra}" "${args[@]}")
+    fi
+
+    # Default to Pro; an explicit effort (including xhigh/extra-high) wins.
+    thinking_time_supplied=false
+    for arg in "$@"; do
+      case "$arg" in
+        --browser-thinking-time|--browser-thinking-time=*) thinking_time_supplied=true ;;
+      esac
+    done
+    if [[ "$thinking_time_supplied" == false ]]; then
+      args=(--browser-thinking-time pro "${args[@]}")
+    fi
+
+    # ChatGPT's multi-file composer can leave otherwise-small source bundles in
+    # an uploading state until Oracle's readiness timeout expires. Pack source
+    # files into one upload by default. Callers can still choose a format or
+    # timeout explicitly; Oracle selects ZIP when a bundle contains binary data.
+    if [[ " $* " != *" --browser-bundle-files "* ]]; then
+      args=(--browser-bundle-files "${args[@]}")
+    fi
+    if [[ " $* " != *" --browser-bundle-format "* ]]; then
+      args=(--browser-bundle-format auto "${args[@]}")
+    fi
+    if [[ " $* " != *" --browser-attachment-timeout "* ]]; then
+      args=(--browser-attachment-timeout 5m "${args[@]}")
+    fi
+    # Absolute path: a PATH with /usr/bin first resolves a stale global oracle
+    # (0.13.0) that bypasses the pinned wrapper and its Browser Use patch.
+    ORACLE_REMOTE_CHROME_WS="$WS_URL" "$SCRIPT_DIR/oracle" "${args[@]}"
+    ;;
+esac

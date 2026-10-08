@@ -1,0 +1,15 @@
+{
+  "assets/oracle-0.21.3-pr516.tgz": "c0649d23b90316d89bf7849ba8d4411f42e407e7683d89bd7665093741bd827e",
+  "bin/oracle": "d375a467980bfdfc1f95fa7bdda573d974eb6095f2ddd83fe1d17eb55479ef5e",
+  "bin/oracle-bu": "a645f228e8d6906365a5b014923a4c6a8a9ff5212757ec6a14cb12aabcbd741b",
+  "install.sh": "a560d9198e40d3631dd6cae07038232ccff8f71f176532bd460ed99ed31589f6",
+  "runtime/package-lock.json": "7f430f827cd541122cf255dd9d525b0e4a0b3dc99f381da248487ff3fe78362f",
+  "runtime/package.json": "b0266a2fb124d79eac5cd2f3a210db14ce108740c943efed0a6b4087657f64fd",
+  "runtime/patch-browseruse.mjs": "6ec9a1e5149d82236a61664ea9f5cedb1cbb6d36fb947e90dd526b6dbc471c68",
+  "runtime/patch-composer-clear.mjs": "5bee528c8d8a4b5bcb0e5034eaeaa7ef6917bcd1d967544d8fe626f72a795d63",
+  "runtime/patch-gpt6-label.mjs": "ca06d58a4d55bcc81a7467896caac2a127ad27404517658cdada9e32286a9d4d",
+  "runtime/patch-post-upload-clear.mjs": "48a2438adb8d8ccf9988f9e5b2a91113ae60ef22259a18f2891deda73e54e8c1",
+  "runtime/patch-segmented-picker.mjs": "4cd8d7573e39c80af436aef4170a7fe86d3725a239268d62037608e172a44cae",
+  "runtime/patch-submit-recovery.mjs": "84a61e1c25ed7f4ada96d1b5674731abd4e4ebb9b6c6a253d9e63082b4b866c6",
+  "runtime/preflight-chatgpt.mjs": "ff3062acb7b6a900fb019f4864702a7d1c5bbf1a49068a7006d791ff355553ea"
+}

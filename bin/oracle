@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Stable entrypoint for the packaged Oracle browser client.
+# Installed build: upstream 0.21.3 plus unmerged PR #516 (current ChatGPT DOM
+# controls), built from source on 2026-09-25 because ChatGPT removed the
+# data-testid attributes Oracle 0.20.0 relied on. The installer supplies the
+# verified tarball and applies the local browser transport and DOM patches.
+set -euo pipefail
+
+ORACLE_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../share/oracle-browseruse" && pwd)"
+REAL_ORACLE="$ORACLE_ROOT/node_modules/.bin/oracle"
+PACKAGE_ROOT="$ORACLE_ROOT/node_modules/@steipete/oracle"
+EXPECTED_VERSION="0.21.3"
+
+if [[ ! -x "${REAL_ORACLE}" || ! -f "${PACKAGE_ROOT}/package.json" ]]; then
+  echo "oracle wrapper: packaged @steipete/oracle installation is missing" >&2
+  exit 127
+fi
+
+installed_version="$(node -p 'require(process.argv[1]).version' "${PACKAGE_ROOT}/package.json")"
+if [[ "${installed_version}" != "${EXPECTED_VERSION}" ]]; then
+  echo "oracle wrapper: installed version ${installed_version} is unverified; expected ${EXPECTED_VERSION}." >&2
+  echo "Review upstream fixes and rerun the browser smoke before changing the pinned version." >&2
+  exit 78
+fi
+
+# The npm registry 0.21.3 lacks PR #516 and cannot drive the current ChatGPT
+# composer. Refuse it rather than failing mid-run on the model picker.
+if ! grep -q 'Select ChatGPT model' "${PACKAGE_ROOT}/dist/src/browser/constants.js"; then
+  echo "oracle wrapper: installed 0.21.3 lacks PR #516; reinstall the verified client package" >&2
+  exit 78
+fi
+
+# Reapply the Browser Use remote-CDP patch, which a reinstall wipes. It adds
+# ORACLE_REMOTE_CHROME_WS so Oracle can drive a Browser Use cloud Chrome.
+PATCH="${ORACLE_ROOT}/patch-browseruse.mjs"
+if ! node "${PATCH}" --check >/dev/null 2>&1; then
+  if ! node "${PATCH}" >&2; then
+    # Without the patch this var is ignored, Oracle silently launches local
+    # Chrome, and the run dies on a Cloudflare challenge instead of here.
+    echo "oracle wrapper: ORACLE_REMOTE_CHROME_WS is set but the Browser Use patch failed to apply." >&2
+    exit 78
+  fi
+fi
+
+# Reapply the bounded prompt-submit recovery patch. It retries once only when
+# Oracle's 60-second probe proves the prompt never left the new-chat composer;
+# ambiguous or started requests are never retried.
+SUBMIT_RECOVERY_PATCH="${ORACLE_ROOT}/patch-submit-recovery.mjs"
+if ! node "${SUBMIT_RECOVERY_PATCH}" --check >/dev/null 2>&1; then
+  if ! node "${SUBMIT_RECOVERY_PATCH}" >&2; then
+    echo "oracle wrapper: bounded prompt-submit recovery patch failed to apply." >&2
+    exit 78
+  fi
+fi
+
+# ChatGPT can restore a persisted ProseMirror draft after an immediate clear
+# reports success. Wait for hydration and verify the composer is still empty
+# before Oracle types the next prompt.
+COMPOSER_CLEAR_PATCH="${ORACLE_ROOT}/patch-composer-clear.mjs"
+if ! node "${COMPOSER_CLEAR_PATCH}" --check >/dev/null 2>&1; then
+  if ! node "${COMPOSER_CLEAR_PATCH}" >&2; then
+    echo "oracle wrapper: settled composer-clear patch failed to apply." >&2
+    exit 78
+  fi
+fi
+
+# Attachment upload can allow the persisted draft to hydrate after the initial
+# clear. Clear and settle text once more after upload, immediately before send.
+POST_UPLOAD_CLEAR_PATCH="${ORACLE_ROOT}/patch-post-upload-clear.mjs"
+if ! node "${POST_UPLOAD_CLEAR_PATCH}" --check >/dev/null 2>&1; then
+  if ! node "${POST_UPLOAD_CLEAR_PATCH}" >&2; then
+    echo "oracle wrapper: post-upload composer-clear patch failed to apply." >&2
+    exit 78
+  fi
+fi
+
+# ChatGPT's 2026-09-25 composer: model radios behind the picker view toggle,
+# profile-button login proof, inconclusive-login re-probe, and completion and
+# markdown capture from the exchange container. See the patch header.
+SEGMENTED_PICKER_PATCH="${ORACLE_ROOT}/patch-segmented-picker.mjs"
+if ! node "${SEGMENTED_PICKER_PATCH}" --check >/dev/null 2>&1; then
+  if ! node "${SEGMENTED_PICKER_PATCH}" >&2; then
+    echo "oracle wrapper: segmented-picker patch failed to apply." >&2
+    exit 78
+  fi
+fi
+
+# ChatGPT renamed the "Latest" model radio to "GPT-6" (2026-10-07). Accept that
+# exact label for the gpt-6-astra "Latest" target. Applied after the segmented
+# picker patch because both touch modelSelection.js.
+GPT6_LABEL_PATCH="${ORACLE_ROOT}/patch-gpt6-label.mjs"
+if ! node "${GPT6_LABEL_PATCH}" --check >/dev/null 2>&1; then
+  if ! node "${GPT6_LABEL_PATCH}" >&2; then
+    echo "oracle wrapper: GPT-6 model label patch failed to apply." >&2
+    exit 78
+  fi
+fi
+
+exec "${REAL_ORACLE}" "$@"
