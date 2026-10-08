@@ -1,0 +1,8 @@
+{
+  "name": "oracle-browseruse-client",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@steipete/oracle": "file:oracle-0.21.3-pr516.tgz"
+  }
+}

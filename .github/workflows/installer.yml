@@ -1,0 +1,26 @@
+name: Installer checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check script syntax
+        shell: bash
+        run: |
+          bash -n install.sh bin/oracle bin/oracle-bu tests/verify-installed.sh
+          for script in runtime/*.mjs; do node --check "$script"; done
+      - name: Install and verify
+        shell: bash
+        run: |
+          bash install.sh "$RUNNER_TEMP/oracle-client"
+          bash tests/verify-installed.sh "$RUNNER_TEMP/oracle-client"
